@@ -1,5 +1,5 @@
 CREATE OR ALTER PROCEDURE usp_QueryStore 
-    @dbname SYSNAME = 'DBASupport', @maxsize int = 512, @Rollback bit = 0
+    @dbname SYSNAME = 'DBA', @maxsize int = 512, @Rollback bit = 0
 AS
 BEGIN
 SET NOCOUNT ON;
