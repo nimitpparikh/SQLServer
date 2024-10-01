@@ -1,0 +1,48 @@
+function Get-SQLInstancesPort {
+    param (
+        [string]$Server = $env:COMPUTERNAME
+    )
+
+    $namespaces = @(
+        "root\Microsoft\SqlServer\ComputerManagement10", # SQL Server 2008
+        "root\Microsoft\SqlServer\ComputerManagement11", # SQL Server 2012
+        "root\Microsoft\SqlServer\ComputerManagement12", # SQL Server 2014
+        "root\Microsoft\SqlServer\ComputerManagement13", # SQL Server 2016
+        "root\Microsoft\SqlServer\ComputerManagement14", # SQL Server 2017
+        "root\Microsoft\SqlServer\ComputerManagement15", # SQL Server 2019
+        "root\Microsoft\SqlServer\ComputerManagement16"  # SQL Server 2022
+    )
+
+    $sqlInstances = @()
+    foreach ($namespace in $namespaces) {
+        $wmiQuery = "SELECT * FROM SqlService WHERE SQLServiceType = 1"
+        $sqlServices = Get-WmiObject -Query $wmiQuery -Namespace $namespace -ComputerName $Server -ErrorAction SilentlyContinue
+
+        foreach ($service in $sqlServices) {
+            $instanceName = if ($service.ServiceName -eq "MSSQLSERVER") { "Default" } else { $service.ServiceName }
+            $tcpKeyPath = if ($instanceName -eq "Default") {
+                "HKLM:\SOFTWARE\Microsoft\MSSQLServer\MSSQLServer\SuperSocketNetLib\Tcp"
+            } else {
+                "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$($instanceName)\MSSQLServer\SuperSocketNetLib\Tcp"
+            }
+            $tcpProps = Get-ItemProperty -Path $tcpKeyPath -ErrorAction SilentlyContinue
+            if ($tcpProps) {
+                $sqlInstances += [PSCustomObject]@{
+                    InstanceName = if ($instanceName -eq "Default") { $Server } else { "$Server\$instanceName" }
+                    TcpPort = if ($tcpProps.TcpPort) { $tcpProps.TcpPort } else { $tcpProps.TcpDynamicPorts }
+                }
+            }
+        }
+    }
+
+    return $sqlInstances
+}
+
+# Get SQL Server instances and their ports
+$instances = Get-SQLInstancesPort
+$instances | ForEach-Object {
+    $SQLServerName = "$($_.InstanceName), $($_.TcpPort)"
+    Write-Output $SQLServerName
+}
+
+$servername = $SQLServerName
