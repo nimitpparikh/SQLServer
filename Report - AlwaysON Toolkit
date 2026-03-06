@@ -1,0 +1,334 @@
+USE [master];
+GO
+
+-- Drop the procedure if it already exists
+IF OBJECT_ID('dbo.usp_AlwaysOnToolkit', 'P') IS NOT NULL
+    DROP PROCEDURE dbo.usp_AlwaysOnToolkit;
+GO
+
+CREATE PROCEDURE dbo.usp_AlwaysOnToolkit
+(
+    @AGName                         NVARCHAR(128) = NULL,
+    @ReplicaServerName              NVARCHAR(128) = NULL,
+    @DBName                         NVARCHAR(128) = NULL,
+    @QueueSizeThresholdMB           INT           = 1024,
+    @LatencyThresholdMinutes        INT           = 10,
+    @ReportMode                     TINYINT       = 1,  -- 1: Full Report, 0: Exception Only
+    @GenerateEndpointRestartScript  BIT           = 0,  -- 1: Generates SQLCMD script
+    @ExecuteLocalEndpointRestart    BIT           = 0,  -- 1: Executes local endpoint restart
+    @ShowSeedingStats               BIT           = 0,  -- 1: Shows physical seeding progress
+    @ShowRecentXEEvents             BIT           = 0,  -- 1: Extracts AlwaysOn_health XE data
+    @EventHoursBack                 INT           = 24  -- Lookback window for Extended Events
+)
+AS
+/***************************************************************************************************
+PROCEDURE:  dbo.usp_AGDiagnosticSuite
+DESCRIPTION:
+    The ultimate "single pane of glass" diagnostic and remediation engine for SQL Server Always On.
+    Combines real-time telemetry, historical Extended Events (XE) log parsing, automatic seeding 
+    tracking, security audits, and actionable remediation scripting.
+
+PARAMETERS:
+    [Filters]
+    - @AGName, @ReplicaServerName, @DBName: Optional isolating filters.
+    
+    [Thresholds & Reporting]
+    - @QueueSizeThresholdMB, @LatencyThresholdMinutes: Alerting thresholds.
+    - @ReportMode: 1 (Verbose) or 0 (Alerts/Exceptions only).
+    
+    [Remediation Actions]
+    - @GenerateEndpointRestartScript: Prints a SQLCMD script to safely cycle cluster endpoints.
+    - @ExecuteLocalEndpointRestart: Immediately cycles the Database Mirroring Endpoint on the local node.
+    
+    [Advanced Telemetry]
+    - @ShowSeedingStats: Real-time Automatic Seeding telemetry.
+    - @ShowRecentXEEvents: Triggers the Extended Events parser for Root Cause Analysis.
+    - @EventHoursBack: Limits disk I/O by only parsing the last N hours of XE data.
+
+OPTIMIZATIONS:
+    - DISK I/O: XE parsing is heavily optimized to read targets exactly once into memory.
+    - TIMEZONES: All outputs (DMVs and XEs) are dynamically calculated to Local Server Time 
+      to eliminate UTC conversion math for global response teams.
+***************************************************************************************************/
+BEGIN
+    SET NOCOUNT ON;
+    SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+
+    ------------------------------------------------------------------------------------------------
+    -- STEP 0: ENVIRONMENT VALIDATION & STANDALONE GUARD
+    ------------------------------------------------------------------------------------------------
+    IF SERVERPROPERTY('IsHadrEnabled') = 0
+    BEGIN
+        PRINT 'NOTIFICATION: Always On High Availability is NOT enabled on ' + @@SERVERNAME + '.';
+        RETURN;
+    END
+
+    IF NOT EXISTS (SELECT 1 FROM master.sys.availability_groups)
+    BEGIN
+        PRINT 'NOTIFICATION: No Availability Groups are configured on ' + @@SERVERNAME + '.';
+        RETURN;
+    END
+
+    -- Global Variables
+    DECLARE @QueueSizeThresholdKB BIGINT = CAST(@QueueSizeThresholdMB AS BIGINT) * 1024;
+    DECLARE @LatencyThresholdSeconds INT = @LatencyThresholdMinutes * 60;
+    DECLARE @EndpointName NVARCHAR(128);
+    DECLARE @Command NVARCHAR(MAX);
+    DECLARE @LocalServerName NVARCHAR(128) = @@SERVERNAME;
+    DECLARE @ServerTZOffset NVARCHAR(10) = DATENAME(tzoffset, SYSDATETIMEOFFSET());
+
+    SELECT TOP 1 @EndpointName = name FROM sys.tcp_endpoints WHERE type_desc = 'DATABASE_MIRRORING';
+
+    ------------------------------------------------------------------------------------------------
+    -- STEP 1: SECURITY AUDIT
+    ------------------------------------------------------------------------------------------------
+    DECLARE @PermCheck TABLE (PrincipalName NVARCHAR(256), PermissionState NVARCHAR(60));
+    INSERT INTO @PermCheck
+    SELECT pr.name, pe.state_desc
+    FROM sys.server_permissions pe
+    JOIN sys.server_principals pr ON pe.grantee_principal_id = pr.principal_id
+    WHERE pe.class_desc = 'ENDPOINT' AND pe.permission_name = 'CONNECT';
+
+    ------------------------------------------------------------------------------------------------
+    -- STEP 2: DATA AGGREGATION & QUEUE MATH
+    ------------------------------------------------------------------------------------------------
+    IF OBJECT_ID('tempdb..#HealthSummary') IS NOT NULL DROP TABLE #HealthSummary;
+
+    WITH AG_Health AS
+    (
+        SELECT
+            ag.name AS [AGName],
+            ar.replica_server_name AS [ReplicaServerName],
+            DB_NAME(drs.database_id) AS [DBName],
+            ar.availability_mode_desc AS [SyncMode],
+            drs.is_primary_replica AS [IsPrimary],
+            drs.synchronization_state_desc AS [SyncState],
+            drs.synchronization_health_desc AS [SyncHealth],
+            ar_states.connected_state_desc AS [ConnectionState], 
+            drs.is_suspended AS [IsSuspended],
+            drs.suspend_reason_desc AS [SuspendReason],
+            drs.log_send_queue_size,
+            drs.log_send_rate,
+            drs.redo_queue_size,
+            drs.redo_rate,
+            CASE WHEN drs.log_send_queue_size > 0 THEN DATEDIFF(second, drs.last_sent_time, GETDATE()) ELSE 0 END AS [SendLatency_Sec],
+            CASE WHEN drs.log_send_queue_size > 0 THEN DATEDIFF(second, drs.last_hardened_time, GETDATE()) ELSE 0 END AS [HardenLatency_Sec],
+            CASE WHEN drs.redo_queue_size > 0 THEN DATEDIFF(second, drs.last_redone_time, GETDATE()) ELSE 0 END AS [RedoLatency_Sec],
+            ISNULL(drs.log_send_queue_size / NULLIF(drs.log_send_rate, 0), 0) AS [EstLogClear_Sec],
+            ISNULL(drs.redo_queue_size / NULLIF(drs.redo_rate, 0), 0) AS [EstRedoClear_Sec]
+        FROM sys.dm_hadr_database_replica_states AS drs
+        INNER JOIN sys.availability_replicas AS ar ON drs.replica_id = ar.replica_id AND drs.group_id = ar.group_id
+        INNER JOIN sys.availability_groups AS ag ON ar.group_id = ag.group_id
+        LEFT JOIN sys.dm_hadr_availability_replica_states AS ar_states ON drs.replica_id = ar_states.replica_id
+    )
+    SELECT * INTO #HealthSummary FROM AG_Health;
+
+    ------------------------------------------------------------------------------------------------
+    -- STEP 3: OUTPUT MAIN HEALTH REPORT
+    ------------------------------------------------------------------------------------------------
+    SELECT
+        @@SERVERNAME AS [LocalServerName],
+        @ServerTZOffset AS [ServerTZ], 
+        h.AGName,
+        h.ReplicaServerName,
+        h.DBName,
+        CASE WHEN h.IsPrimary = 1 THEN 'PRIMARY' ELSE 'SECONDARY' END AS [Role],
+        ISNULL(h.ConnectionState, 'UNKNOWN') AS [ConnectionState],
+        h.SyncState,
+        h.IsSuspended,
+        CASE WHEN h.log_send_queue_size > 1048576 THEN FORMAT(h.log_send_queue_size / 1048576.0, 'N1') + ' GB'
+             ELSE FORMAT(h.log_send_queue_size / 1024.0, 'N1') + ' MB' END AS [SendQueue],
+        CASE WHEN h.redo_queue_size > 1048576 THEN FORMAT(h.redo_queue_size / 1048576.0, 'N1') + ' GB'
+             ELSE FORMAT(h.redo_queue_size / 1024.0, 'N1') + ' MB' END AS [RedoQueue],
+        CASE WHEN h.IsPrimary = 1 THEN 'N/A' 
+             ELSE CAST(h.EstLogClear_Sec / 86400 AS VARCHAR) + '_' + CONVERT(VARCHAR(8), DATEADD(second, h.EstLogClear_Sec % 86400, 0), 108) END AS [EstLogClear_DD_HHMMSS],
+        CASE WHEN h.IsPrimary = 1 THEN 'N/A' 
+             ELSE CAST(h.EstRedoClear_Sec / 86400 AS VARCHAR) + '_' + CONVERT(VARCHAR(8), DATEADD(second, h.EstRedoClear_Sec % 86400, 0), 108) END AS [EstRedoClear_DD_HHMMSS],
+        CASE WHEN h.IsPrimary = 1 THEN 'N/A' 
+             ELSE CAST(h.SendLatency_Sec / 86400 AS VARCHAR) + '_' + CONVERT(VARCHAR(8), DATEADD(second, h.SendLatency_Sec % 86400, 0), 108) END AS [SendLatency_DD_HHMMSS]
+    FROM #HealthSummary h
+    WHERE
+        (@AGName IS NULL OR h.AGName = @AGName)
+        AND (@ReplicaServerName IS NULL OR h.ReplicaServerName = @ReplicaServerName)
+        AND (@DBName IS NULL OR h.DBName = @DBName)
+        AND (
+            @ReportMode = 1 OR (
+                @ReportMode = 0 AND h.IsPrimary = 0 AND (
+                    h.log_send_queue_size > @QueueSizeThresholdKB
+                    OR h.redo_queue_size > @QueueSizeThresholdKB
+                    OR h.SendLatency_Sec > @LatencyThresholdSeconds
+                    OR ISNULL(h.ConnectionState, '') <> 'CONNECTED'
+                )
+            )
+        )
+    ORDER BY h.AGName, h.DBName, h.IsPrimary DESC;
+
+    IF @ReportMode = 1 OR EXISTS (SELECT 1 FROM #HealthSummary WHERE ISNULL(ConnectionState, '') <> 'CONNECTED')
+    BEGIN
+        SELECT 'ENDPOINT SECURITY AUDIT' AS [Category], * FROM @PermCheck;
+    END
+
+    ------------------------------------------------------------------------------------------------
+    -- STEP 4: PHYSICAL SEEDING STATS (@ShowSeedingStats = 1)
+    ------------------------------------------------------------------------------------------------
+    IF @ShowSeedingStats = 1
+    BEGIN
+        PRINT '------------------------------------------------------------------------------------------------';
+        PRINT '-- PHYSICAL SEEDING STATUS';
+        PRINT '------------------------------------------------------------------------------------------------';
+
+        IF EXISTS (SELECT 1 FROM sys.dm_hadr_physical_seeding_stats)
+        BEGIN
+            WITH SeedingBase AS (
+                SELECT 
+                    remote_machine_name AS [RemoteMachineName],
+                    local_database_name AS [DatabaseName],
+                    internal_state_desc AS [InternalState],
+                    transfer_rate_bytes_per_second * 60 / (1024 * 1024) AS [TransferRate_MBPerMin],
+                    transferred_size_bytes / (1024 * 1024) AS [Transferred_MB],
+                    database_size_bytes / (1024 * 1024) AS [DBSize_MB],
+                    start_time_utc,
+                    estimate_time_complete_utc,
+                    CASE WHEN estimate_time_complete_utc <= GETUTCDATE() THEN 0 
+                         ELSE DATEDIFF(SECOND, GETUTCDATE(), estimate_time_complete_utc) END AS [SecRemaining]
+                FROM sys.dm_hadr_physical_seeding_stats
+                WHERE (@DBName IS NULL OR local_database_name = @DBName)
+            )
+            SELECT 
+                RemoteMachineName, DatabaseName, InternalState, TransferRate_MBPerMin, Transferred_MB, DBSize_MB,
+                @ServerTZOffset AS [ServerTZ],
+                DATEADD(MINUTE, DATEDIFF(MINUTE, GETUTCDATE(), GETDATE()), start_time_utc) AS [StartTime_ServerLocal],
+                DATEADD(MINUTE, DATEDIFF(MINUTE, GETUTCDATE(), GETDATE()), estimate_time_complete_utc) AS [EstimatedFinish_ServerLocal],
+                CASE WHEN estimate_time_complete_utc IS NULL THEN 'Calculating...'
+                     ELSE CAST(SecRemaining / 86400 AS VARCHAR(10)) + '_' + CONVERT(VARCHAR(8), DATEADD(second, SecRemaining % 86400, 0), 108) 
+                END AS [EstTimeRemaining_DD_HHMMSS]
+            FROM SeedingBase;
+        END
+        ELSE
+        BEGIN
+            PRINT '-- [INFO] No active physical seeding operations found.';
+        END
+    END
+
+    ------------------------------------------------------------------------------------------------
+    -- STEP 5: ROOT CAUSE ANALYSIS - EXTENDED EVENTS PARSER (@ShowRecentXEEvents = 1)
+    ------------------------------------------------------------------------------------------------
+    IF @ShowRecentXEEvents = 1
+    BEGIN
+        PRINT '------------------------------------------------------------------------------------------------';
+        PRINT '-- EXTENDED EVENTS: ALWAYSON_HEALTH (Last ' + CAST(@EventHoursBack AS VARCHAR(5)) + ' Hours)';
+        PRINT '------------------------------------------------------------------------------------------------';
+
+        DECLARE @XEFileName NVARCHAR(4000);
+        
+        -- Get the active AlwaysOn_health file path reliably
+        SELECT @XEFileName = CAST(target_data AS XML).value('(EventFileTarget/File/@name)[1]', 'nvarchar(4000)')
+        FROM sys.dm_xe_sessions s
+        JOIN sys.dm_xe_session_targets t ON s.address = t.event_session_address
+        WHERE s.name = N'AlwaysOn_health' AND t.target_name = N'event_file';
+
+        IF @XEFileName IS NULL
+        BEGIN
+            PRINT '-- [ERROR] AlwaysOn_health extended event session is not running or no file target is configured.';
+        END
+        ELSE
+        BEGIN
+            IF OBJECT_ID('tempdb..#RawXE') IS NOT NULL DROP TABLE #RawXE;
+
+            -- OPTIMIZATION: Read the file ONCE into a temp table, and filter by time immediately.
+            SELECT CAST(event_data AS XML) AS EventNode
+            INTO #RawXE
+            FROM sys.fn_xe_file_target_read_file(@XEFileName, NULL, NULL, NULL)
+            WHERE DATEDIFF(HOUR, CAST(CAST(event_data AS XML).value('(event/@timestamp)[1]', 'datetime2(3)') AS DATETIME), GETUTCDATE()) <= @EventHoursBack;
+
+            -- Shred the optimized memory-resident XML
+            SELECT 
+                EventNode.value('(event/@name)[1]', 'varchar(100)') AS [EventType],
+                DATEADD(MINUTE, DATEDIFF(MINUTE, GETUTCDATE(), GETDATE()), EventNode.value('(event/@timestamp)[1]', 'datetime2(3)')) AS [EventTime_Local],
+                @ServerTZOffset AS [ServerTZ],
+                EventNode.value('(event/data[@name="availability_group_name"]/value)[1]', 'varchar(128)') AS [AGName],
+                EventNode.value('(event/data[@name="availability_replica_name"]/value)[1]', 'varchar(128)') AS [ReplicaName],
+                
+                -- The "WHO" and "HOW" (Restored from your original logic)
+                EventNode.value('(event/action[@name="username"]/value)[1]', 'varchar(255)') AS [Username],
+                EventNode.value('(event/action[@name="client_app_name"]/value)[1]', 'varchar(255)') AS [ClientApp],
+                EventNode.value('(event/data[@name="statement"]/value)[1]', 'varchar(max)') AS [DDL_Command_Executed],
+
+                -- State changes & Errors
+                EventNode.value('(event/data[@name="error_number"]/value)[1]', 'int') AS [ErrorNum],
+                EventNode.value('(event/data[@name="previous_state"]/text)[1]', 'varchar(255)') AS [PrevState],
+                EventNode.value('(event/data[@name="current_state"]/text)[1]', 'varchar(255)') AS [NewState],
+                EventNode.value('(event/data[@name="message"]/value)[1]', 'varchar(max)') AS [EventMessage]
+            FROM #RawXE
+            WHERE 
+                EventNode.value('(event/@name)[1]', 'varchar(100)') IN (
+                    'availability_replica_state_change',
+                    'availability_replica_manager_state_change',
+                    'error_reported',
+                    'alwayson_ddl_executed'
+                )
+            ORDER BY EventNode.value('(event/@timestamp)[1]', 'datetime2(3)') DESC;
+
+            DROP TABLE #RawXE;
+        END
+    END
+    ------------------------------------------------------------------------------------------------
+    -- STEP 6: REMEDIATION ENGINE 
+    ------------------------------------------------------------------------------------------------
+    IF @EndpointName IS NULL AND (@GenerateEndpointRestartScript = 1 OR @ExecuteLocalEndpointRestart = 1) RETURN;
+
+    IF @ExecuteLocalEndpointRestart = 1
+    BEGIN
+        PRINT '*************************************************************************************************';
+        PRINT '/* EXECUTING ENDPOINT RESTART ON LOCAL SERVER: ' + @LocalServerName;
+        PRINT '*************************************************************************************************';
+        BEGIN TRY
+            SET @Command = N'ALTER ENDPOINT [' + @EndpointName + '] STATE = STOPPED;';
+            EXEC sp_executesql @Command;
+            WAITFOR DELAY '00:00:05';
+            SET @Command = N'ALTER ENDPOINT [' + @EndpointName + '] STATE = STARTED;';
+            EXEC sp_executesql @Command;
+            PRINT 'SUCCESS: Endpoint [' + @EndpointName + '] restarted successfully.';
+        END TRY
+        BEGIN CATCH
+            PRINT 'ERROR: Failed to restart endpoint. Error: ' + ERROR_MESSAGE();
+        END CATCH
+    END
+
+    IF @GenerateEndpointRestartScript = 1
+    BEGIN
+        PRINT '/*************************************************************************************************';
+        PRINT '/* AUTOMATED ENDPOINT RESTART SCRIPT (SQLCMD MODE REQUIRED)';
+        PRINT '*************************************************************************************************/';
+        DECLARE @Replica NVARCHAR(128), @IsPri BIT;
+        DECLARE cur CURSOR FOR SELECT DISTINCT ReplicaServerName, IsPrimary FROM #HealthSummary ORDER BY IsPrimary ASC; 
+        OPEN cur; FETCH NEXT FROM cur INTO @Replica, @IsPri;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            PRINT ':CONNECT ' + @Replica;
+            PRINT 'ALTER ENDPOINT [' + ISNULL(@EndpointName, 'DATABASE_MIRRORING') + '] STATE = STOPPED;';
+            PRINT 'GO';
+            PRINT 'WAITFOR DELAY ''00:00:05'';';
+            PRINT 'ALTER ENDPOINT [' + ISNULL(@EndpointName, 'DATABASE_MIRRORING') + '] STATE = STARTED;';
+            PRINT 'GO';
+            IF EXISTS (SELECT 1 FROM #HealthSummary WHERE ReplicaServerName = @Replica AND IsSuspended = 1)
+            BEGIN
+                DECLARE @db_res NVARCHAR(128);
+                DECLARE db_cur CURSOR FOR SELECT DBName FROM #HealthSummary WHERE ReplicaServerName = @Replica AND IsSuspended = 1;
+                OPEN db_cur; FETCH NEXT FROM db_cur INTO @db_res;
+                WHILE @@FETCH_STATUS = 0
+                BEGIN
+                    PRINT 'ALTER DATABASE [' + @db_res + '] SET HADR RESUME;';
+                    FETCH NEXT FROM db_cur INTO @db_res;
+                END
+                CLOSE db_cur; DEALLOCATE db_cur;
+                PRINT 'GO';
+            END
+            FETCH NEXT FROM cur INTO @Replica, @IsPri;
+        END
+        CLOSE cur; DEALLOCATE cur;
+    END
+
+    DROP TABLE #HealthSummary;
+END;
+GO
